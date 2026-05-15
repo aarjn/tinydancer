@@ -245,7 +245,7 @@ impl ClientService<UiConfig> for UiService {
                         }
                         _ => {}
                     }
-                    Mutex::unlock(status);
+                    drop(status);
                     enable_raw_mode();
                     if crossterm::event::poll(Duration::from_millis(100)).unwrap() {
                         let ev = crossterm::event::read().unwrap();
@@ -262,7 +262,7 @@ impl ClientService<UiConfig> for UiService {
                             *status = ClientStatus::ShuttingDown(String::from(
                                 "Shutting Down Gracefully...",
                             ));
-                            Mutex::unlock(status);
+                            drop(status);
                             disable_raw_mode();
                         }
                     }
