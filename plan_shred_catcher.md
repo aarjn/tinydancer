@@ -448,198 +448,417 @@ Two integration paths (choose based on effort):
 
 4. **crates.io vs git** — solana-gossip v3.1.11 is on crates.io. Need to verify it works without git dependency on Agave repo. If not, use `git = "https://github.com/anza-xyz/agave"` with a tag.
 
+---
 
+## How Shred-Catcher Captures Shreds
+
+Shreds are NOT available via HTTP/WSS/RPC. They travel as **raw UDP packets** between
+validators. Shred-catcher captures them through two methods:
+
+### Method 1: Turbine — Passive UDP Listener (bonus)
+
+```
+Leader broadcasts shreds via Turbine (UDP tree)
+│
+├──► Validator A (retransmits to children)
+├──► Validator B (retransmits to children)
+├──► ...
+└──► shred-catcher (our node, if in the Turbine tree)
+         │
+         │  Binds a UDP socket (TVU port)
+         │  Advertises it via gossip so the network knows about us
+         │  Receives raw shred packets (~1280 bytes each)
+         │  Deserializes: Shred::new_from_serialized_shred(packet)
+         ▼
+    Shred captured in memory
+```
+
+Limitation: Turbine tree is stake-weighted. Zero-stake node sits at the bottom,
+may miss shreds. Also needs inbound UDP ports open (doesn't work behind NAT).
+
+### Method 2: Repair — Active UDP Requests (primary strategy)
+
+This is the main approach. Validators keep shreds in memory for a short window
+(a few minutes) for their own repair protocol. During that window, any gossip
+participant can request specific shreds.
+
+**There is no URL.** The target is a raw UDP socket address discovered via gossip.
+
+```
+Step 1: Discover validators via gossip
+│
+│  shred-catcher joins gossip → discovers all validators
+│  Each validator's ContactInfo includes:
+│
+│    ContactInfo {
+│        id:           "dv4ACNkpYPcE3...",         // validator pubkey
+│        gossip:       64.130.33.238:8001,          // gossip protocol
+│        tvu:          64.130.33.238:8002,          // Turbine shreds port
+│        repair:       64.130.33.238:8008,          // repair requests port
+│        serve_repair: 64.130.33.238:8009,          // ← WE SEND REQUESTS HERE
+│        rpc:          64.130.33.238:8899,          // standard JSON-RPC
+│        ...
+│    }
+│
+▼
+Step 2: Monitor slot progression
+│
+│  Watch for new slots via gossip or RPC slotSubscribe
+│  "Slot 462500001 just started"
+│
+▼
+Step 3: Send repair request (raw UDP)
+│
+│  Our UDP socket ────── UDP packet ──────► 64.130.33.238:8009
+│                                           (validator's serve_repair port)
+│
+│  Packet contains (serialized with bincode):
+│    RepairProtocol::WindowIndex {
+│        slot: 462500001,
+│        shred_index: 42,
+│    }
+│
+▼
+Step 4: Receive response (raw UDP)
+│
+│                  ◄────── UDP packet ────── Validator responds with
+│                                            raw shred bytes (~1280 bytes)
+│
+▼
+Step 5: Deserialize and store
+│
+│  Shred::new_from_serialized_shred(response_bytes)
+│  → Store in DashMap keyed by (slot, index)
+│  → Available via ShredCatcher::get_shreds() API
+```
+
+**Why Repair works behind NAT**: We send the UDP request outbound. The validator's
+response comes back on the same UDP socket (NAT hole-punching). No inbound ports needed.
+
+**Why there's a time window**: Validators only keep shreds in memory for repair purposes
+for a few minutes. After block assembly + confirmation, shreds are garbage collected.
+Shred-catcher must capture them during this window — after that, they're gone forever.
+
+**Why we request from any validator, not just the leader**: The leader could be malicious.
+Every validator that received the shreds via Turbine has a copy. We request from random
+validators (discovered via gossip) to avoid trusting any single node.
+
+### What standard RPCs give you vs what shred-catcher gives you
+
+```
+Standard RPC (HTTP/WSS):                     Shred-Catcher (raw UDP):
+  getBlock → assembled block                   Raw shred fragments
+  getSlot → slot number                        Leader's ED25519 signature
+  slotSubscribe → slot updates                 Merkle proof per shred
+  getTransaction → parsed tx                   FEC coding shreds
+                                               Shred headers (slot, index, FEC set)
+  ✗ No Merkle proofs                           
+  ✗ No leader signatures on data               ✓ Everything needed for
+  ✗ No raw shred structure                       Data Availability Sampling
+  ✗ Shreds already discarded                     (tinydancer's core verification)
+```
+
+---
 
 # The Life of a Shred
 
-  1. Why shreds exist
+## 1. Why Shreds Exist
 
-  Solana produces blocks every ~400ms. A block can be several MB of transaction data. You can't send that as one giant UDP packet (max UDP =
-  ~1200 bytes). So blocks are shredded — split into small fragments that can be individually transmitted, verified, and reassembled.
+Solana produces blocks every ~400ms. A block can be several MB of transaction data.
+You can't send that as one giant UDP packet (max UDP payload ~1232 bytes for IPv6).
+So blocks are **shredded** — split into small fragments that can be individually
+transmitted, verified, and reassembled.
 
-  Think of it like sending a book page-by-page through the mail, where each page has a stamp proving which book it belongs to.
+Think of it like sending a book page-by-page through the mail, where each page has
+a stamp proving which book it belongs to and who wrote it.
 
-  2. Block → Shreds (generation)
+## 2. Block to Shreds (Generation)
 
-  Leader validator produces a block for Slot 12345
-  │
-  │  Block contains: 500 transactions, ~2MB total
-  │
-  ▼
-  STEP 1: Split into Entries
-  │  Entries = ordered groups of transactions
-  │  [Entry0: tx1,tx2,tx3] [Entry1: tx4,tx5] [Entry2: tx6,tx7,tx8] ...
-  │
-  ▼
-  STEP 2: Serialize entries into a byte stream
-  │  Raw bytes: [0x4a, 0x2f, 0x8c, 0x1b, ...]  (~2MB)
-  │
-  ▼
-  STEP 3: Chunk into Data Shreds
-  │  Each data shred holds ~1051 bytes of payload
-  │  DataShred[0]: bytes[0..1051]
-  │  DataShred[1]: bytes[1051..2102]
-  │  DataShred[2]: bytes[2102..3153]
-  │  ... (~200 data shreds for a 2MB block)
-  │
-  ▼
-  STEP 4: Generate Coding Shreds (Reed-Solomon FEC)
-  │  For every N data shreds, generate M coding shreds
-  │  These are redundancy — if some data shreds are lost in transit,
-  │  you can reconstruct them from coding shreds
-  │  CodingShred[0], CodingShred[1], ...
-  │
-  ▼
-  STEP 5: Build Merkle Tree
-  │  All shreds (data + coding) for this FEC set are leaves
-  │  A Merkle tree is built over them
-  │  Each shred gets a Merkle proof (path from leaf to root)
-  │  This proves: "this shred belongs to this specific block"
-  │
-  ▼
-  STEP 6: Leader Signs
-  │  The leader signs the Merkle root with their ED25519 private key
-  │  This signature is embedded in each shred
-  │  This proves: "the leader actually produced this shred"
+```
+Leader validator produces a block for Slot 12345
+│
+│  Block contains: 500 transactions, ~2MB total
+│
+▼
+STEP 1: Split into Entries
+│  Entries = ordered groups of transactions with PoH hashes
+│  [Entry0: tx1,tx2,tx3] [Entry1: tx4,tx5] [Entry2: tx6,tx7,tx8] ...
+│
+▼
+STEP 2: Serialize entries into a byte stream
+│  Raw bytes: [0x4a, 0x2f, 0x8c, 0x1b, ...]  (~2MB)
+│
+▼
+STEP 3: Chunk into Data Shreds
+│  Each data shred holds ~1051 bytes of payload
+│  DataShred[0]: bytes[0..1051]      ← first fragment
+│  DataShred[1]: bytes[1051..2102]   ← second fragment
+│  DataShred[2]: bytes[2102..3153]   ← third fragment
+│  ... (~200 data shreds for a 2MB block)
+│  Last data shred has LAST_IN_SLOT flag set
+│
+▼
+STEP 4: Generate Coding Shreds (Reed-Solomon FEC)
+│  For every batch of K data shreds, generate M coding shreds
+│  These are redundancy — if some data shreds are lost in transit,
+│  you can reconstruct them from coding shreds (like RAID parity)
+│  CodingShred[0], CodingShred[1], ...
+│  Together: K data + M coding = one "FEC set"
+│
+▼
+STEP 5: Build Merkle Tree (per FEC set)
+│  All shreds in the FEC set (data + coding) become leaves
+│
+│       Merkle Root (this gets signed)
+│           /          \
+│         H01           H23
+│        /   \         /   \
+│     H0      H1    H2      H3
+│     │       │     │       │
+│  Data[0] Data[1] Code[0] Code[1]   ← leaves = shreds
+│
+│  Each shred gets a Merkle proof (the sibling hashes on the path to root)
+│  Example: Data[0]'s proof = [H1, H23] — enough to recompute the root
+│  This proves: "this shred belongs to this specific FEC set"
+│
+▼
+STEP 6: Leader Signs the Merkle Root
+│  The leader signs the root with their ED25519 private key
+│  This signature is embedded in EVERY shred's header
+│  This proves: "the slot leader actually produced this data"
+│  If anyone modifies a shred → Merkle proof breaks
+│  If anyone forges a shred → signature verification fails
+```
 
-  3. Shred structure (what's inside)
+## 3. Shred Structure (What's Inside Each ~1280 Byte Packet)
 
-  ┌─────────────────────────────────────────────┐
-  │ Shred Header (common)                       │
-  │   signature: [u8; 64]    ← leader's ED25519 │
-  │   shred_variant: u8      ← data or coding   │
-  │   slot: u64              ← which slot/block  │
-  │   index: u32             ← position in slot  │
-  │   version: u16           ← shred version     │
-  │   fec_set_index: u32     ← which FEC group   │
-  ├─────────────────────────────────────────────┤
-  │ Data Shred payload (if data shred)          │
-  │   parent_offset: u16     ← distance to parent│
-  │   flags: u8              ← last-in-slot etc  │
-  │   payload: [u8; ~1051]   ← actual block data │
-  ├─────────────────────────────────────────────┤
-  │ OR Coding Shred payload (if coding shred)   │
-  │   num_data_shreds: u16                      │
-  │   num_coding_shreds: u16                    │
-  │   position: u16          ← index in FEC set │
-  │   payload: [u8; ~1051]   ← FEC parity data  │
-  ├─────────────────────────────────────────────┤
-  │ Merkle Proof                                │
-  │   proof: Vec<[u8; 20]>   ← path to root     │
-  └─────────────────────────────────────────────┘
+```
+┌──────────────────────────────────────────────────────────┐
+│ COMMON HEADER (every shred has this)                     │
+│                                                          │
+│   signature: [u8; 64]      ← leader's ED25519 signature │
+│                               (signs the Merkle root)    │
+│   shred_variant: u8        ← encodes type + auth method │
+│                               (data/code, legacy/merkle) │
+│   slot: u64                ← which slot (block height)   │
+│   index: u32               ← position within the slot    │
+│   version: u16             ← cluster shred version       │
+│   fec_set_index: u32       ← which FEC group this is in │
+├──────────────────────────────────────────────────────────┤
+│ IF DATA SHRED:                                           │
+│                                                          │
+│   parent_offset: u16       ← slots back to parent block │
+│   flags: u8                ← DATA_COMPLETE_SHRED,        │
+│                               LAST_SHRED_IN_SLOT         │
+│   payload: [u8; ~1051]     ← actual serialized entries   │
+│                               (the real block content)    │
+├──────────────────────────────────────────────────────────┤
+│ IF CODING SHRED:                                         │
+│                                                          │
+│   num_data_shreds: u16     ← K (data shreds in FEC set) │
+│   num_coding_shreds: u16   ← M (coding shreds in set)   │
+│   position: u16            ← index within coding shreds  │
+│   payload: [u8; ~1051]     ← Reed-Solomon parity data    │
+├──────────────────────────────────────────────────────────┤
+│ MERKLE PROOF (appended at end)                           │
+│                                                          │
+│   proof: Vec<[u8; 20]>     ← sibling hashes from leaf   │
+│                               to Merkle root             │
+│                               (typically 3-5 hashes)     │
+│                                                          │
+│   This allows anyone to verify this shred belongs to     │
+│   the block without having all the other shreds          │
+└──────────────────────────────────────────────────────────┘
 
-  4. Shred → Network (Turbine broadcast)
+Total size per shred: ~1228 bytes (fits in one UDP packet)
+SIZE_OF_PAYLOAD = 1228 (IPv6 MTU 1280 - 48 byte IP header - 4 byte padding)
+```
 
-  Leader has ~400 shreds for Slot 12345
-  │
-  ▼
-  TURBINE PROTOCOL (UDP broadcast tree)
-  │
-  │  The network is organized into a tree based on stake weight:
-  │
-  │  Layer 0: Leader
-  │           │
-  │  Layer 1: ┌──────┼──────┐        (top validators by stake)
-  │           V1     V2     V3
-  │           │      │      │
-  │  Layer 2: ┌┤    ┌┤    ┌─┤        (mid validators)
-  │           V4 V5 V6 V7 V8 V9
-  │           │     │     │
-  │  Layer 3: ...  ...   ...         (lower stake validators)
-  │
-  │  Each node retransmits to its children
-  │  Fanout = 200 (each node sends to up to 200 children)
-  │  Entire network receives all shreds in 3-4 hops (~200ms)
-  │
-  ▼
-  Each validator receives shreds as UDP packets
-  │  One UDP packet = one shred (~1280 bytes)
-  │  ~800-1000 shreds per second at current Devnet throughput
+## 4. Shred to Network (Turbine Broadcast)
 
-  5. Shred → Verification (what tinydancer does)
+```
+Leader has ~400 shreds for Slot 12345
+│
+▼
+TURBINE PROTOCOL (stake-weighted UDP broadcast tree)
+│
+│  Validators are organized into a tree based on stake weight:
+│  Higher stake = closer to leader = receives shreds first
+│
+│  Layer 0: Leader
+│           │
+│  Layer 1: ┌──────┼──────┐         (top validators by stake)
+│           V1     V2     V3        receive directly from leader
+│           │      │      │
+│  Layer 2: ┌┤    ┌┤    ┌─┤         (mid-stake validators)
+│           V4 V5 V6 V7 V8 V9      receive from Layer 1
+│           │     │     │
+│  Layer 3: ...  ...   ...          (lower stake validators)
+│                                    receive from Layer 2
+│
+│  Each node retransmits to its children upon receipt
+│  Fanout = 200 (each node sends to up to 200 children)
+│  Entire network receives all shreds in 3-4 hops (~200ms)
+│
+▼
+Each validator receives shreds as individual UDP packets
+│  One UDP packet = one shred (~1280 bytes)
+│  ~800-1000 shreds per second at current throughput
+│  Shreds arrive out of order — Turbine doesn't guarantee ordering
+│
+▼
+Validator stores shreds temporarily in Blockstore
+│  Waiting until enough arrive to reassemble the block
+│  Also keeps them for a few minutes for Repair protocol
+│  (other nodes can request missing shreds during this window)
+│
+▼
+Eventually: shreds are garbage collected
+│  After block is assembled + confirmed + executed
+│  Raw shreds are discarded — they're no longer needed
+│  *** This is the window shred-catcher must capture them ***
+```
 
-  Received shred for Slot 12345, Index 42
-  │
-  ▼
-  CHECK 1: Signature Verification
-  │  "Was this shred signed by the leader of Slot 12345?"
-  │  - Look up leader schedule → leader = Pubkey(ABC...)
-  │  - Verify ED25519 signature on shred against leader's pubkey
-  │  - PASS: leader produced this shred
-  │  - FAIL: forged or tampered
-  │
-  ▼
-  CHECK 2: Merkle Proof Verification
-  │  "Does this shred belong to this block?"
-  │  - Recompute hash from shred data (leaf)
-  │  - Walk the Merkle proof path up to the root
-  │  - Compare computed root with the signed root
-  │  - PASS: shred is part of this block
-  │  - FAIL: shred was swapped from a different block
-  │
-  ▼
-  RESULT: Shred is cryptographically verified ✓
+## 5. Shred Verification (What Tinydancer / Shred-Catcher Does)
 
-  6. Shred → Block Reassembly
+```
+Received shred for Slot 12345, Index 42
+(obtained via Repair request or Turbine)
+│
+▼
+CHECK 1: Leader Signature Verification
+│
+│  "Was this shred actually produced by the leader of Slot 12345?"
+│
+│  1. Look up leader schedule → leader for slot 12345 = Pubkey(ABC...)
+│     (leader schedule is deterministic, derived from stake distribution)
+│  2. Extract signature from shred header (64 bytes)
+│  3. Extract the signed payload (Merkle root hash)
+│  4. Verify ED25519: verify(signature, merkle_root, leader_pubkey)
+│
+│  PASS → the slot leader produced this shred
+│  FAIL → forged by someone who doesn't have the leader's private key
+│
+▼
+CHECK 2: Merkle Proof Verification
+│
+│  "Does this shred actually belong to this block?"
+│
+│  1. Hash the shred data to get the leaf hash
+│  2. Walk the Merkle proof (sibling hashes) upward:
+│       leaf_hash + proof[0] → H_parent
+│       H_parent + proof[1]  → H_grandparent
+│       ...                  → computed_root
+│  3. Compare computed_root with the signed Merkle root
+│
+│  PASS → this shred is genuinely part of this FEC set / block
+│  FAIL → shred was modified, or swapped from a different block
+│
+▼
+BOTH CHECKS PASS → Shred is cryptographically verified ✓
+│
+│  This proves two things:
+│  1. The leader produced this data (signature)
+│  2. This data belongs to this block (Merkle proof)
+│
+│  A malicious actor would need the leader's private key to forge shreds
+│  — which they don't have (unless they ARE the leader, caught by consensus)
+```
 
-  Validator collects shreds for Slot 12345
-  │
-  │  Has: DataShred[0], DataShred[1], ... DataShred[199]
-  │       CodingShred[0], CodingShred[1], ...
-  │
-  ▼
-  If some data shreds are missing:
-  │  Use Reed-Solomon decoding with coding shreds to recover them
-  │
-  ▼
-  Concatenate all data shred payloads in order:
-  │  DataShred[0].payload + DataShred[1].payload + ...
-  │
-  ▼
-  Deserialize back into Entries → Transactions
-  │
-  ▼
-  Full block reconstructed → execute transactions → update state
+## 6. Shred to Block Reassembly (What Full Validators Do)
 
-  7. Full lifecycle summary
+```
+Validator collects shreds for Slot 12345 over ~400ms
+│
+│  Has: DataShred[0], DataShred[1], ... DataShred[199]
+│       CodingShred[0], CodingShred[1], ...
+│
+▼
+Check: do we have all data shreds?
+├── YES → proceed to concatenation
+├── NO, but have enough coding shreds
+│       → Use Reed-Solomon decoding to recover missing data shreds
+│         (can recover K data shreds from any K of K+M total shreds)
+└── NO, not enough of either
+        → Send Repair requests to other validators for missing shreds
+          (this is the same Repair protocol shred-catcher uses!)
+│
+▼
+Concatenate all data shred payloads in order:
+│  DataShred[0].payload ++ DataShred[1].payload ++ ... ++ DataShred[199].payload
+│  Result: the original serialized byte stream (~2MB)
+│
+▼
+Deserialize back into Entries
+│  Each Entry = PoH hash + list of transactions
+│
+▼
+Execute all transactions against bank state
+│  Process each transaction: debit accounts, credit accounts, run programs
+│
+▼
+Vote on the block
+│  If state transition is valid → validator votes to confirm
+│  Vote is broadcast via gossip to the rest of the network
+│
+▼
+Block confirmed when 2/3 supermajority of stake votes on it
+│  Raw shreds are then garbage collected (no longer needed)
+```
 
-  Leader creates block
-      → splits into data shreds
-      → generates coding shreds (FEC)
-      → builds Merkle tree over all shreds
-      → signs Merkle root
-      → broadcasts via Turbine (UDP tree)
-          → validators receive shreds
-          → verify signature + Merkle proof
-          → reassemble block from shreds
-          → execute transactions
-          → shreds are discarded (by standard validators)
+## 7. Full Lifecycle Summary
 
-  Can shred-catcher be built without diet-rpc-validator?
+```
+CREATION:
+  Leader creates block from pending transactions
+  → serializes into entries
+  → chunks entries into Data Shreds (~1051 bytes each)
+  → generates Coding Shreds (Reed-Solomon FEC for redundancy)
+  → builds Merkle tree over each FEC set of shreds
+  → signs the Merkle root with leader's ED25519 private key
+  → embeds signature + Merkle proof in every shred
 
-  Yes, absolutely. The diet-rpc-validator was only needed because:
-  1. Tinydancer's gossip crate was pinned to v1.15.0 (too old for current network)
-  2. The getShreds RPC method was custom to that fork
+PROPAGATION:
+  → broadcasts shreds via Turbine (stake-weighted UDP tree)
+  → each validator receives shreds as raw UDP packets
+  → validators retransmit to their Turbine children
+  → entire network has all shreds within ~200ms
 
-  A new independent project can use official Solana crates at modern versions:
+REPAIR (the window shred-catcher exploits):
+  → validators keep shreds in memory for a few minutes
+  → any gossip participant can request specific shreds via UDP
+  → request: RepairProtocol::WindowIndex { slot, shred_index }
+  → response: raw shred bytes
+  → *** shred-catcher captures shreds here ***
 
-  ┌───────────────────────────────────────────┬──────────────────┬─────────────────┐
-  │               What you need               │      Crate       │ Current version │
-  ├───────────────────────────────────────────┼──────────────────┼─────────────────┤
-  │ Shred types (Shred, ShredData, ShredCode) │ solana-ledger    │ v4.0.x          │
-  ├───────────────────────────────────────────┼──────────────────┼─────────────────┤
-  │ Gossip protocol                           │ solana-gossip    │ v4.0.x          │
-  ├───────────────────────────────────────────┼──────────────────┼─────────────────┤
-  │ Keypairs, pubkeys, signatures             │ solana-sdk       │ v4.0.x          │
-  ├───────────────────────────────────────────┼──────────────────┼─────────────────┤
-  │ UDP packet handling                       │ solana-streamer  │ v4.0.x          │
-  ├───────────────────────────────────────────┼──────────────────┼─────────────────┤
-  │ Network utilities                         │ solana-net-utils │ v4.0.x          │
-  └───────────────────────────────────────────┴──────────────────┴─────────────────┘
+VERIFICATION (what tinydancer does with captured shreds):
+  → verify leader signature (ED25519 on Merkle root)
+  → verify Merkle proof (shred belongs to this block)
+  → sample r random shreds → probability of undetected attack = 1/2^r
 
-  Using v4.0.x crates means your gossip will actually work with current Devnet/Mainnet validators (which we proved are running v4.0.0).
+ASSEMBLY:
+  → validators reassemble block from data shreds
+  → recover missing shreds via Reed-Solomon + Repair
+  → execute transactions → update state
 
-  The project would be completely standalone — no dependency on tinydancer or diet-rpc-validator. Tinydancer could later be updated to use
-  shred-catcher as its data source.
+CONSENSUS:
+  → validators vote on the block
+  → 2/3 supermajority stake confirms it
+  → shreds are garbage collected (gone forever from most validators)
+```
 
-  Want me to start planning the new independent shred-catcher project?
+## Why This Tool Can't Exist As An RPC Extension
+
+Standard Solana RPCs serve **blocks** (the assembled result after shreds are discarded).
+By the time you call `getBlock`, the raw shreds with their Merkle proofs and leader
+signatures are already gone. There is no RPC method to retrieve them because validators
+don't keep them.
+
+The only way to get raw shreds is to be present on the network during the short
+window between broadcast and garbage collection — either passively via Turbine or
+actively via Repair. That's what shred-catcher does.
+
+diet-rpc-validator solved this by modifying the validator to NOT discard shreds and
+serving them via a custom `getShreds` RPC. But that requires running a full validator
+(128GB RAM, 12+ CPU cores). Shred-catcher achieves the same result with 2-4GB RAM
+by capturing shreds in real-time from the live network.
