@@ -81,6 +81,46 @@ All from official Solana/Agave crates published on crates.io:
 **Key point**: Using v3.1.x crates means gossip will work with current Devnet (v4.0.0)
 and Mainnet validators. The gossip protocol is backwards-compatible within major versions.
 
+### About the "deprecated" warnings on Solana crates
+
+All Solana crates (solana-gossip, solana-ledger, solana-streamer, etc.) show a
+deprecation warning starting from v3.1.0. **They are NOT being removed or replaced.**
+
+**What happened**: Anza (the team behind Agave, the Solana validator) reclassified all
+internal validator crates as "Agave Unstable API." These crates were originally built
+as internal components, not stable public libraries. But the ecosystem (Jito, tinydancer,
+RPC providers, MEV tools) started depending on them heavily.
+
+Instead of choosing between "break everyone" or "never refactor," Anza added the
+deprecation warning as a policy marker:
+
+> "You can still use these crates, but you must explicitly acknowledge they're
+> unstable. If we rename `Shred::new_from_serialized_shred()` to `Shred::from_bytes()`
+> in a future release, that's expected — you signed up for it."
+
+**The actual status**:
+- Code is NOT deleted — every crate still works
+- APIs are NOT removed — same structs, functions, and types
+- Gossip protocol is NOT changed — v3.1.x talks to v4.0.0 validators fine
+- The "deprecated" label is a governance/stability signal, not a technical removal
+
+**What we need to do**: Add the `agave-unstable-api` feature flag. This is required
+from v4.0.0 onward to compile, and good practice on v3.1.x:
+
+```toml
+[dependencies]
+solana-gossip    = { version = "3.1", features = ["agave-unstable-api"] }
+solana-ledger    = { version = "3.1", features = ["agave-unstable-api"] }
+solana-streamer  = { version = "3.1", features = ["agave-unstable-api"] }
+solana-net-utils = { version = "3.1", features = ["agave-unstable-api"] }
+solana-sdk       = "2.2"  # sdk doesn't require the flag
+```
+
+**Maintenance trade-off**: When Agave releases new versions (v4.1, v4.2), some internal
+APIs might change. We'd need to update our code accordingly. This is normal for any
+project depending on validator internals — the alternative (diet-rpc-validator pinned to
+v1.15.0) is worse because the gossip protocol becomes incompatible with the live network.
+
 ---
 
 ## Project Structure (library-first design)
@@ -606,40 +646,67 @@ STEP 4: Generate Coding Shreds (Reed-Solomon FEC)
 │  Together: K data + M coding = one "FEC set"
 │
 ▼
-STEP 5: Build Merkle Tree (per FEC set)
-│  All shreds in the FEC set (data + coding) become leaves
+STEP 5 & 6: Sign the shreds
 │
-│       Merkle Root (this gets signed)
-│           /          \
-│         H01           H23
-│        /   \         /   \
-│     H0      H1    H2      H3
-│     │       │     │       │
-│  Data[0] Data[1] Code[0] Code[1]   ← leaves = shreds
+│  ┌─────────────────────────────────────────────────────────────────┐
+│  │ LEGACY METHOD (old Solana, no longer produced on live network) │
+│  │                                                                 │
+│  │  Leader signs EACH shred individually with ED25519              │
+│  │  No Merkle tree, no Merkle proofs                               │
+│  │                                                                 │
+│  │  Problem: you can verify the leader signed a shred, but you     │
+│  │  CANNOT verify that the shred belongs to this specific block.   │
+│  │  A malicious leader could swap shreds between blocks and the    │
+│  │  signature would still verify.                                  │
+│  │                                                                 │
+│  │  This is why the whitepaper (page 2) says:                      │
+│  │  "the legacy method didn't have merkle proofs in shreds"        │
+│  └─────────────────────────────────────────────────────────────────┘
 │
-│  Each shred gets a Merkle proof (the sibling hashes on the path to root)
-│  Example: Data[0]'s proof = [H1, H23] — enough to recompute the root
-│  This proves: "this shred belongs to this specific FEC set"
-│
-▼
-STEP 6: Leader Signs the Merkle Root
-│  The leader signs the root with their ED25519 private key
-│  This signature is embedded in EVERY shred's header
-│  This proves: "the slot leader actually produced this data"
-│  If anyone modifies a shred → Merkle proof breaks
-│  If anyone forges a shred → signature verification fails
+│  ┌─────────────────────────────────────────────────────────────────┐
+│  │ MERKLE METHOD (current Solana, what shred-catcher works with)  │
+│  │                                                                 │
+│  │  STEP 5: Build Merkle Tree (per FEC set)                        │
+│  │  All shreds in the FEC set (data + coding) become leaves:       │
+│  │                                                                 │
+│  │       Merkle Root (this gets signed)                            │
+│  │           /          \                                          │
+│  │         H01           H23                                       │
+│  │        /   \         /   \                                      │
+│  │     H0      H1    H2      H3                                   │
+│  │     │       │     │       │                                     │
+│  │  Data[0] Data[1] Code[0] Code[1]   ← leaves = shreds           │
+│  │                                                                 │
+│  │  Each shred gets a Merkle proof (sibling hashes to the root)    │
+│  │  Example: Data[0]'s proof = [H1, H23] — enough to recompute    │
+│  │  the root. This proves: "this shred belongs to this FEC set"    │
+│  │                                                                 │
+│  │  STEP 6: Leader Signs the Merkle Root (once, not per shred)     │
+│  │  The leader signs the root with their ED25519 private key       │
+│  │  This signature is embedded in EVERY shred's header             │
+│  │                                                                 │
+│  │  Now TWO things are cryptographically guaranteed:               │
+│  │  1. Leader produced this data (signature on root)               │
+│  │  2. This shred belongs to this block (Merkle proof)             │
+│  │  Modify any shred → Merkle proof breaks                         │
+│  │  Swap a shred from another block → proof doesn't match root     │
+│  │  Forge a shred → need leader's private key (impossible)         │
+│  └─────────────────────────────────────────────────────────────────┘
 ```
 
 ## 3. Shred Structure (What's Inside Each ~1280 Byte Packet)
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│ COMMON HEADER (every shred has this)                     │
+│ COMMON HEADER (every shred has this — legacy and merkle) │
 │                                                          │
 │   signature: [u8; 64]      ← leader's ED25519 signature │
-│                               (signs the Merkle root)    │
+│                               legacy: signs the shred    │
+│                               merkle: signs Merkle root  │
 │   shred_variant: u8        ← encodes type + auth method │
-│                               (data/code, legacy/merkle) │
+│                               two 4-bit values:          │
+│                               type (data/code) +         │
+│                               auth (legacy/merkle)       │
 │   slot: u64                ← which slot (block height)   │
 │   index: u32               ← position within the slot    │
 │   version: u16             ← cluster shred version       │
@@ -660,14 +727,21 @@ STEP 6: Leader Signs the Merkle Root
 │   position: u16            ← index within coding shreds  │
 │   payload: [u8; ~1051]     ← Reed-Solomon parity data    │
 ├──────────────────────────────────────────────────────────┤
-│ MERKLE PROOF (appended at end)                           │
+│ MERKLE PROOF (only in Merkle shreds, NOT in legacy)      │
 │                                                          │
 │   proof: Vec<[u8; 20]>     ← sibling hashes from leaf   │
 │                               to Merkle root             │
 │                               (typically 3-5 hashes)     │
 │                                                          │
 │   This allows anyone to verify this shred belongs to     │
-│   the block without having all the other shreds          │
+│   the block without having all the other shreds.         │
+│   Legacy shreds do NOT have this — you can only verify   │
+│   the leader's signature, not block membership.          │
+│                                                          │
+│   Current Solana (v4.0) only produces Merkle shreds.     │
+│   Legacy types still exist in the codebase for           │
+│   backwards compatibility but are not seen on the        │
+│   live network.                                          │
 └──────────────────────────────────────────────────────────┘
 
 Total size per shred: ~1228 bytes (fits in one UDP packet)
